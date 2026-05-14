@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场批量上架助手
 // @namespace    https://steamcommunity.com/
-// @version      0.3.1
+// @version      0.3.2
 // @description  在 Steam 库存页批量选择物品、查询最低价、修改售价并自动执行上架流程。
 // @author       Codex
 // @match        https://steamcommunity.com/*
@@ -13,6 +13,7 @@
   "use strict";
 
   const PANEL_ID = "tm-batch-seller-panel";
+  const PANEL_HOST_ID = "tm-batch-seller-host";
   const STYLE_ID = "tm-batch-seller-style";
   const HOLDER_MARKER = "tm-batch-holder";
   const CHECKBOX_CLASS = "tm-batch-checkbox";
@@ -341,6 +342,21 @@
     return query(`#${PANEL_ID}`);
   }
 
+  function findPanelHost() {
+    return query(`#${PANEL_HOST_ID}`);
+  }
+
+  function ensurePanelHost() {
+    const existing = findPanelHost();
+    if (existing) {
+      return existing;
+    }
+    const host = document.createElement("div");
+    host.id = PANEL_HOST_ID;
+    document.documentElement.appendChild(host);
+    return host;
+  }
+
   function renderLogs() {
     const container = query(`#${PANEL_ID} [data-role="logs"]`);
     if (!container) {
@@ -486,8 +502,15 @@
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-      #${PANEL_ID} {
+      #${PANEL_HOST_ID} {
         position: fixed;
+        inset: 0;
+        z-index: 2147483646;
+        pointer-events: none;
+      }
+
+      #${PANEL_ID} {
+        position: absolute;
         top: 16px;
         left: calc(100vw - 376px);
         width: 360px;
@@ -505,6 +528,7 @@
         border-radius: 10px;
         box-shadow: 0 20px 48px rgba(0, 0, 0, 0.45);
         font: 13px/1.4 Arial, sans-serif;
+        pointer-events: auto;
       }
 
       #${PANEL_ID} * {
@@ -775,6 +799,7 @@
     if (findPanel()) {
       return;
     }
+    const host = ensurePanelHost();
     const panel = document.createElement("aside");
     panel.id = PANEL_ID;
     panel.innerHTML = `
@@ -829,7 +854,7 @@
         <div class="tm-logs" data-role="logs"></div>
       </div>
     `;
-    document.body.appendChild(panel);
+    host.appendChild(panel);
     applyStoredPanelLayout(panel);
     bindPanelDragAndResize(panel);
     bindPanelEvents(panel);
@@ -987,16 +1012,18 @@
     if (state.panel.dragShield?.isConnected) {
       return state.panel.dragShield;
     }
+    const host = ensurePanelHost();
     const shield = document.createElement("div");
     shield.dataset.role = "tm-drag-shield";
     Object.assign(shield.style, {
-      position: "fixed",
+      position: "absolute",
       inset: "0",
-      zIndex: "999998",
+      zIndex: "0",
       cursor: "move",
       background: "transparent",
+      pointerEvents: "auto",
     });
-    document.body.appendChild(shield);
+    host.appendChild(shield);
     state.panel.dragShield = shield;
     return shield;
   }
