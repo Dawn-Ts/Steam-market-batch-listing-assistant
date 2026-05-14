@@ -52,6 +52,7 @@
     mutationObserver: null,
     panel: {
       drag: null,
+      dragShield: null,
       resizeObserver: null,
     },
     inventorySweepRunning: false,
@@ -255,6 +256,16 @@
     return query(".inventory_page");
   }
 
+  function hasInventoryShell() {
+    return Boolean(
+      query("#inventories") ||
+      query(".inventory_ctn") ||
+      query(".inventory_page") ||
+      query(".inventory_pagecontrols") ||
+      query(".itemHolder"),
+    );
+  }
+
   function currentItemHolders() {
     const page = visibleInventoryPage();
     if (!page) {
@@ -323,7 +334,7 @@
   }
 
   function inventoryActionsAvailable() {
-    return isInventoryPage() && Boolean(visibleInventoryPage());
+    return isInventoryPage();
   }
 
   function findPanel() {
@@ -367,6 +378,7 @@
     const mode = query('[data-role="mode"]', panel);
     const summary = query('[data-role="result-summary"]', panel);
     const inventoryReady = inventoryActionsAvailable();
+    const inventoryLoaded = hasInventoryShell();
 
     if (detected) {
       detected.textContent = String(state.counters.lastScanCount);
@@ -415,7 +427,7 @@
       bulkPriceInput.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
     }
     if (mode) {
-      mode.textContent = inventoryReady ? "库存页" : "非库存页";
+      mode.textContent = inventoryReady ? (inventoryLoaded ? "库存页" : "库存页(加载中)") : "非库存页";
     }
     if (summary) {
       summary.textContent = `成功 ${state.queue.results.success.length} | 失败 ${state.queue.results.failed.length}`;
@@ -454,7 +466,12 @@
     }
     const items = selectedItems();
     if (items.length === 0) {
-      container.innerHTML = `<div class="tm-empty">${inventoryActionsAvailable() ? "请选择库存物品，生成待上架队列。" : "当前不是库存页，库存操作已禁用。"}</div>`;
+      const emptyText = inventoryActionsAvailable()
+        ? hasInventoryShell()
+          ? "请选择库存物品，生成待上架队列。"
+          : "已进入库存页，等待 Steam 库存内容加载。"
+        : "当前不是库存页，库存操作已禁用。";
+      container.innerHTML = `<div class="tm-empty">${emptyText}</div>`;
       renderSummary();
       return;
     }
@@ -470,7 +487,7 @@
     style.id = STYLE_ID;
     style.textContent = `
       #${PANEL_ID} {
-        position: absolute;
+        position: fixed;
         top: 16px;
         left: calc(100vw - 376px);
         width: 360px;
@@ -958,10 +975,37 @@
       const message =
         holders.length > 0
           ? `当前页识别到 ${holders.length} 个可见物品。`
-          : "暂未识别到库存物品，请打开库存页并等待 Steam 渲染完成。";
-      updateStatus(message, holders.length > 0 ? "success" : "error");
+          : hasInventoryShell()
+            ? "库存页已打开，但当前还没有识别到可处理物品。"
+            : "已进入库存页，等待 Steam 库存渲染完成...";
+      updateStatus(message, holders.length > 0 ? "success" : hasInventoryShell() ? "error" : "info");
       log(message);
     }
+  }
+
+  function ensureDragShield() {
+    if (state.panel.dragShield?.isConnected) {
+      return state.panel.dragShield;
+    }
+    const shield = document.createElement("div");
+    shield.dataset.role = "tm-drag-shield";
+    Object.assign(shield.style, {
+      position: "fixed",
+      inset: "0",
+      zIndex: "999998",
+      cursor: "move",
+      background: "transparent",
+    });
+    document.body.appendChild(shield);
+    state.panel.dragShield = shield;
+    return shield;
+  }
+
+  function removeDragShield() {
+    if (state.panel.dragShield?.isConnected) {
+      state.panel.dragShield.remove();
+    }
+    state.panel.dragShield = null;
   }
 
   function scheduleScan() {
@@ -2103,11 +2147,12 @@
     if (!panel) {
       return;
     }
+    const rect = panel.getBoundingClientRect();
     const layout = {
-      top: Math.max(8, Math.round(panel.offsetTop)),
-      left: Math.max(8, Math.round(panel.offsetLeft)),
-      width: Math.max(PANEL_MIN_WIDTH, Math.round(panel.offsetWidth)),
-      height: Math.max(PANEL_MIN_HEIGHT, Math.round(panel.offsetHeight)),
+      top: Math.max(8, Math.round(rect.top)),
+      left: Math.max(8, Math.round(rect.left)),
+      width: Math.max(PANEL_MIN_WIDTH, Math.round(rect.width)),
+      height: Math.max(PANEL_MIN_HEIGHT, Math.round(rect.height)),
     };
     window.localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(layout));
   }
@@ -2119,24 +2164,22 @@
       PANEL_MIN_HEIGHT,
       Number(saved?.height) || Math.min(780, window.innerHeight - 32),
     );
-    const defaultTop = Math.max(8, window.scrollY + 16);
-    const top = Math.max(8, Number(saved?.top) || defaultTop);
-    const defaultLeft = Math.max(8, window.scrollX + window.innerWidth - width - 16);
+    const top = Math.max(8, Number(saved?.top) || 16);
+    const defaultLeft = Math.max(8, window.innerWidth - width - 16);
     const left = Math.max(8, Number(saved?.left) || defaultLeft);
     panel.style.width = `${Math.min(width, window.innerWidth - 8)}px`;
     panel.style.height = `${Math.min(height, window.innerHeight - 8)}px`;
-    panel.style.left = `${left}px`;
-    panel.style.top = `${top}px`;
+    panel.style.left = `${Math.min(left, Math.max(8, window.innerWidth - width - 8))}px`;
+    panel.style.top = `${Math.min(top, Math.max(8, window.innerHeight - height - 8))}px`;
     panel.style.right = "auto";
   }
 
-  function clampPanelInsideDocument(panel) {
-    const maxLeft = Math.max(8, document.documentElement.scrollWidth - 80);
-    const maxTop = Math.max(8, document.documentElement.scrollHeight - 80);
-    const nextLeft = Math.min(Math.max(8, panel.offsetLeft), maxLeft);
-    const nextTop = Math.min(Math.max(8, panel.offsetTop), maxTop);
-    panel.style.left = `${nextLeft}px`;
-    panel.style.top = `${nextTop}px`;
+  function clampPanelInsideViewport(panel) {
+    const rect = panel.getBoundingClientRect();
+    const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
+    const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+    panel.style.left = `${Math.min(Math.max(8, rect.left), maxLeft)}px`;
+    panel.style.top = `${Math.min(Math.max(8, rect.top), maxTop)}px`;
   }
 
   function bindPanelDragAndResize(panel) {
@@ -2146,13 +2189,15 @@
         if (event.button !== 0) {
           return;
         }
+        event.preventDefault();
+        event.stopPropagation();
         state.panel.drag = {
-          startX: event.pageX,
-          startY: event.pageY,
+          startX: event.clientX,
+          startY: event.clientY,
           baseLeft: panel.offsetLeft,
           baseTop: panel.offsetTop,
         };
-        event.preventDefault();
+        ensureDragShield();
       });
     }
 
@@ -2160,30 +2205,32 @@
       if (!state.panel.drag) {
         return;
       }
-      const nextLeft = state.panel.drag.baseLeft + (event.pageX - state.panel.drag.startX);
-      const nextTop = state.panel.drag.baseTop + (event.pageY - state.panel.drag.startY);
+      event.preventDefault();
+      const nextLeft = state.panel.drag.baseLeft + (event.clientX - state.panel.drag.startX);
+      const nextTop = state.panel.drag.baseTop + (event.clientY - state.panel.drag.startY);
       panel.style.left = `${Math.max(8, nextLeft)}px`;
       panel.style.top = `${Math.max(8, nextTop)}px`;
       panel.style.right = "auto";
-      clampPanelInsideDocument(panel);
+      clampPanelInsideViewport(panel);
     });
 
     window.addEventListener("mouseup", () => {
       if (state.panel.drag) {
         state.panel.drag = null;
-        clampPanelInsideDocument(panel);
+        clampPanelInsideViewport(panel);
       }
+      removeDragShield();
       savePanelLayout(panel);
     });
 
     window.addEventListener("resize", () => {
-      clampPanelInsideDocument(panel);
+      clampPanelInsideViewport(panel);
       savePanelLayout(panel);
     });
 
     if (window.ResizeObserver) {
       state.panel.resizeObserver = new window.ResizeObserver(() => {
-        clampPanelInsideDocument(panel);
+        clampPanelInsideViewport(panel);
         savePanelLayout(panel);
       });
       state.panel.resizeObserver.observe(panel);
@@ -2209,6 +2256,7 @@
     buildPanel();
     await waitForAnimationFrame();
     if (isInventoryPage()) {
+      updateStatus("已进入库存页，等待 Steam 库存渲染完成...", "info");
       scanInventory(true);
     } else {
       clearInventoryState();
