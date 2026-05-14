@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场批量上架助手
 // @namespace    https://steamcommunity.com/
-// @version      0.3.0
+// @version      0.3.1
 // @description  在 Steam 库存页批量选择物品、查询最低价、修改售价并自动执行上架流程。
 // @author       Codex
 // @match        https://steamcommunity.com/*
@@ -38,6 +38,7 @@
     "start-queue",
     "sell-all-lowest",
     "sweep-inventory",
+    "sweep-inventory-minus-one-cent",
   ]);
 
   const state = {
@@ -355,6 +356,7 @@
     const startButton = query('[data-action="start-queue"]', panel);
     const sellAllLowestButton = query('[data-action="sell-all-lowest"]', panel);
     const sweepInventoryButton = query('[data-action="sweep-inventory"]', panel);
+    const sweepInventoryMinusOneCentButton = query('[data-action="sweep-inventory-minus-one-cent"]', panel);
     const pauseButton = query('[data-action="toggle-pause"]', panel);
     const scanButton = query('[data-action="scan"]', panel);
     const selectAllButton = query('[data-action="select-all"]', panel);
@@ -386,6 +388,9 @@
     }
     if (sweepInventoryButton) {
       sweepInventoryButton.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
+    }
+    if (sweepInventoryMinusOneCentButton) {
+      sweepInventoryMinusOneCentButton.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
     }
     if (pauseButton) {
       pauseButton.textContent = state.paused ? "继续脚本" : "暂停脚本";
@@ -465,7 +470,7 @@
     style.id = STYLE_ID;
     style.textContent = `
       #${PANEL_ID} {
-        position: fixed;
+        position: absolute;
         top: 16px;
         left: calc(100vw - 376px);
         width: 360px;
@@ -757,9 +762,9 @@
     panel.id = PANEL_ID;
     panel.innerHTML = `
       <div class="tm-head">
-        <div class="tm-title-wrap" data-role="drag-handle">
+          <div class="tm-title-wrap" data-role="drag-handle">
           <div class="tm-title">Steam 批量上架助手</div>
-          <div class="tm-title-sub">可拖动，可缩放，刷新后记住位置</div>
+          <div class="tm-title-sub">全站同一面板，可拖动，可缩放</div>
         </div>
         <div class="tm-mode" data-role="mode">库存页</div>
       </div>
@@ -793,6 +798,7 @@
           <button data-action="start-queue">确认价格并自动上架</button>
           <button data-action="sell-all-lowest">全页最低价一键上架</button>
           <button data-action="sweep-inventory">跨分页全库存清仓</button>
+          <button data-action="sweep-inventory-minus-one-cent">全库存最低价-0.01上架</button>
           <button data-action="toggle-pause">暂停脚本</button>
         </div>
         <div>
@@ -843,6 +849,8 @@
           await sellAllVisibleAtLowestPrice();
         } else if (action === "sweep-inventory") {
           await sweepAllInventoryAtLowestPrice();
+        } else if (action === "sweep-inventory-minus-one-cent") {
+          await sweepAllInventoryAtLowestPriceMinusOneCent();
         } else if (action === "toggle-pause") {
           togglePause();
         } else if (action === "copy-lowest") {
@@ -1333,6 +1341,66 @@
     });
     renderRows();
     updateStatus(`已将 ${normalized} 应用到 ${items.length} 件已选物品。`, "success");
+  }
+
+  function formatPriceNumber(value) {
+    if (!Number.isFinite(value) || value <= 0) {
+      return "";
+    }
+    return value.toFixed(2);
+  }
+
+  function applyPriceOffsetToItems(items, offset, source) {
+    let adjustedCount = 0;
+    const adjustedItems = [];
+    const failedItems = [];
+
+    items.forEach((item) => {
+      const basePrice = parsePriceNumber(item.priceValue || item.priceDisplay);
+      if (basePrice === null) {
+        item.status = "价格调整失败";
+        item.statusTone = "error";
+        item.lastError = "缺少可计算的基准价格";
+        failedItems.push(item);
+        return;
+      }
+
+      const adjustedPrice = Math.max(0.01, Math.round((basePrice + offset) * 100) / 100);
+      const normalized = formatPriceNumber(adjustedPrice);
+      if (!normalized) {
+        item.status = "价格调整失败";
+        item.statusTone = "error";
+        item.lastError = `价格调整后无效：${adjustedPrice}`;
+        failedItems.push(item);
+        return;
+      }
+
+      item.priceValue = normalized;
+      item.status = source;
+      item.statusTone = "success";
+      adjustedCount += 1;
+      adjustedItems.push({
+        id: item.id,
+        name: item.name || item.label,
+        basePrice: formatPriceNumber(basePrice),
+        adjustedPrice: normalized,
+      });
+    });
+
+    renderRows();
+    log(`价格偏移处理完成：${source}`, {
+      offset,
+      adjustedCount,
+      failedCount: failedItems.length,
+      adjustedItems,
+      failedItems: failedItems.map((item) => ({
+        id: item.id,
+        name: item.name || item.label,
+        lastError: item.lastError,
+      })),
+    });
+
+    return { adjustedCount, adjustedItems, failedItems };
   }
 
   function validateQueueItems(items) {
@@ -1911,6 +1979,113 @@
     }
   }
 
+  async function sweepAllInventoryAtLowestPriceMinusOneCent() {
+    if (state.queue.running || state.inventorySweepRunning || !inventoryActionsAvailable()) {
+      updateStatus("当前已有正在执行的任务，请稍后再试。", "error");
+      return;
+    }
+
+    state.inventorySweepRunning = true;
+    renderSummary();
+    try {
+      updateStatus("正在回到第一页并准备按最低价-0.01清仓...", "info");
+      log("开始执行全库存最低价-0.01上架。");
+      await gotoFirstInventoryPage();
+
+      let pageCounter = 0;
+      let totalAttempted = 0;
+      let totalQueued = 0;
+      let totalPriceFailed = 0;
+      let totalAdjusted = 0;
+
+      while (pageCounter < 500) {
+        await waitWhilePaused("等待继续跨分页最低价-0.01清仓");
+        pageCounter += 1;
+        scanInventory(true);
+        const currentPage = currentPageNumber();
+        const totalPages = totalPageNumber();
+        const visibleItems = Array.from(state.items.values()).filter((item) => isVisible(item.element));
+
+        log("开始处理库存分页（最低价-0.01）。", {
+          currentPage,
+          totalPages,
+          visibleCount: visibleItems.length,
+          signature: currentVisiblePageSignature(),
+        });
+
+        if (visibleItems.length > 0) {
+          totalAttempted += visibleItems.length;
+          setAllSelections(true);
+          const items = selectedItems();
+          await queryLowestPrices(items, `全库存最低价-0.01上架-第${currentPage || pageCounter}页`);
+
+          const failedItems = items.filter((item) => item.status === "查价失败");
+          totalPriceFailed += failedItems.length;
+          if (failedItems.length > 0) {
+            failedItems.forEach((item) => {
+              state.selectedIds.delete(item.id);
+              if (item.checkbox) {
+                item.checkbox.checked = false;
+              }
+            });
+            renderRows();
+            renderSummary();
+          }
+
+          const queueItems = selectedItems();
+          if (queueItems.length > 0) {
+            const adjustment = applyPriceOffsetToItems(queueItems, -0.01, "最低价-0.01");
+            totalAdjusted += adjustment.adjustedCount;
+            const validQueueItems = selectedItems().filter((item) => item.status !== "价格调整失败");
+            if (validQueueItems.length > 0) {
+              totalQueued += validQueueItems.length;
+              updateStatus(
+                `正在按最低价-0.01清仓第 ${currentPage || pageCounter}${totalPages ? `/${totalPages}` : ""} 页，共 ${validQueueItems.length} 件物品...`,
+                "info",
+              );
+              log("当前分页开始进入自动上架队列（最低价-0.01）。", {
+                currentPage,
+                queueCount: validQueueItems.length,
+                queueItems: validQueueItems.map((item) => ({
+                  id: item.id,
+                  name: item.name || item.label,
+                  price: item.priceValue,
+                })),
+              });
+              await startQueue();
+            } else {
+              log("当前分页没有价格调整后可继续上架的物品。", { currentPage });
+            }
+          }
+        }
+
+        const moved = await gotoNextInventoryPage();
+        if (!moved) {
+          break;
+        }
+      }
+
+      updateStatus(
+        `全库存最低价-0.01上架完成。共尝试 ${totalAttempted} 件，调价 ${totalAdjusted} 件，送入队列 ${totalQueued} 件，查价失败 ${totalPriceFailed} 件。`,
+        "success",
+      );
+      log("全库存最低价-0.01上架完成。", {
+        totalAttempted,
+        totalAdjusted,
+        totalQueued,
+        totalPriceFailed,
+        endPage: currentPageNumber(),
+      });
+    } catch (error) {
+      updateStatus(`全库存最低价-0.01上架失败：${error.message}`, "error");
+      log(`全库存最低价-0.01上架失败：${error.message}`);
+    } finally {
+      state.inventorySweepRunning = false;
+      state.paused = false;
+      renderSummary();
+    }
+  }
+
   function loadPanelLayout() {
     try {
       const raw = window.localStorage.getItem(PANEL_LAYOUT_KEY);
@@ -1928,12 +2103,11 @@
     if (!panel) {
       return;
     }
-    const rect = panel.getBoundingClientRect();
     const layout = {
-      top: Math.max(8, Math.round(rect.top)),
-      left: Math.max(8, Math.round(rect.left)),
-      width: Math.max(PANEL_MIN_WIDTH, Math.round(rect.width)),
-      height: Math.max(PANEL_MIN_HEIGHT, Math.round(rect.height)),
+      top: Math.max(8, Math.round(panel.offsetTop)),
+      left: Math.max(8, Math.round(panel.offsetLeft)),
+      width: Math.max(PANEL_MIN_WIDTH, Math.round(panel.offsetWidth)),
+      height: Math.max(PANEL_MIN_HEIGHT, Math.round(panel.offsetHeight)),
     };
     window.localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(layout));
   }
@@ -1945,22 +2119,24 @@
       PANEL_MIN_HEIGHT,
       Number(saved?.height) || Math.min(780, window.innerHeight - 32),
     );
-    const top = Math.max(8, Number(saved?.top) || 16);
-    const defaultLeft = Math.max(8, window.innerWidth - width - 16);
+    const defaultTop = Math.max(8, window.scrollY + 16);
+    const top = Math.max(8, Number(saved?.top) || defaultTop);
+    const defaultLeft = Math.max(8, window.scrollX + window.innerWidth - width - 16);
     const left = Math.max(8, Number(saved?.left) || defaultLeft);
     panel.style.width = `${Math.min(width, window.innerWidth - 8)}px`;
     panel.style.height = `${Math.min(height, window.innerHeight - 8)}px`;
-    panel.style.left = `${Math.min(left, Math.max(8, window.innerWidth - width - 8))}px`;
-    panel.style.top = `${Math.min(top, Math.max(8, window.innerHeight - height - 8))}px`;
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
     panel.style.right = "auto";
   }
 
-  function clampPanelInsideViewport(panel) {
-    const rect = panel.getBoundingClientRect();
-    const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
-    const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
-    panel.style.left = `${Math.min(Math.max(8, rect.left), maxLeft)}px`;
-    panel.style.top = `${Math.min(Math.max(8, rect.top), maxTop)}px`;
+  function clampPanelInsideDocument(panel) {
+    const maxLeft = Math.max(8, document.documentElement.scrollWidth - 80);
+    const maxTop = Math.max(8, document.documentElement.scrollHeight - 80);
+    const nextLeft = Math.min(Math.max(8, panel.offsetLeft), maxLeft);
+    const nextTop = Math.min(Math.max(8, panel.offsetTop), maxTop);
+    panel.style.left = `${nextLeft}px`;
+    panel.style.top = `${nextTop}px`;
   }
 
   function bindPanelDragAndResize(panel) {
@@ -1971,8 +2147,8 @@
           return;
         }
         state.panel.drag = {
-          startX: event.clientX,
-          startY: event.clientY,
+          startX: event.pageX,
+          startY: event.pageY,
           baseLeft: panel.offsetLeft,
           baseTop: panel.offsetTop,
         };
@@ -1984,30 +2160,30 @@
       if (!state.panel.drag) {
         return;
       }
-      const nextLeft = state.panel.drag.baseLeft + (event.clientX - state.panel.drag.startX);
-      const nextTop = state.panel.drag.baseTop + (event.clientY - state.panel.drag.startY);
+      const nextLeft = state.panel.drag.baseLeft + (event.pageX - state.panel.drag.startX);
+      const nextTop = state.panel.drag.baseTop + (event.pageY - state.panel.drag.startY);
       panel.style.left = `${Math.max(8, nextLeft)}px`;
       panel.style.top = `${Math.max(8, nextTop)}px`;
       panel.style.right = "auto";
-      clampPanelInsideViewport(panel);
+      clampPanelInsideDocument(panel);
     });
 
     window.addEventListener("mouseup", () => {
       if (state.panel.drag) {
         state.panel.drag = null;
-        clampPanelInsideViewport(panel);
+        clampPanelInsideDocument(panel);
       }
       savePanelLayout(panel);
     });
 
     window.addEventListener("resize", () => {
-      clampPanelInsideViewport(panel);
+      clampPanelInsideDocument(panel);
       savePanelLayout(panel);
     });
 
     if (window.ResizeObserver) {
       state.panel.resizeObserver = new window.ResizeObserver(() => {
-        clampPanelInsideViewport(panel);
+        clampPanelInsideDocument(panel);
         savePanelLayout(panel);
       });
       state.panel.resizeObserver.observe(panel);
