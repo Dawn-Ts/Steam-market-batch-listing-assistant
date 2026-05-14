@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场批量上架助手
 // @namespace    https://steamcommunity.com/
-// @version      0.3.3
+// @version      0.3.4
 // @description  在 Steam 库存页批量选择物品、查询最低价、修改售价并自动执行上架流程。
 // @author       Codex
 // @match        https://steamcommunity.com/*
@@ -43,6 +43,7 @@
     "start-queue",
     "sell-all-lowest",
     "sweep-inventory",
+    "sweep-inventory-custom-price",
     "sweep-inventory-minus-one-cent",
   ]);
 
@@ -404,6 +405,7 @@
     const startButton = query('[data-action="start-queue"]', panel);
     const sellAllLowestButton = query('[data-action="sell-all-lowest"]', panel);
     const sweepInventoryButton = query('[data-action="sweep-inventory"]', panel);
+    const sweepInventoryCustomPriceButton = query('[data-action="sweep-inventory-custom-price"]', panel);
     const sweepInventoryMinusOneCentButton = query('[data-action="sweep-inventory-minus-one-cent"]', panel);
     const pauseButton = query('[data-action="toggle-pause"]', panel);
     const scanButton = query('[data-action="scan"]', panel);
@@ -439,6 +441,9 @@
     }
     if (sweepInventoryButton) {
       sweepInventoryButton.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
+    }
+    if (sweepInventoryCustomPriceButton) {
+      sweepInventoryCustomPriceButton.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
     }
     if (sweepInventoryMinusOneCentButton) {
       sweepInventoryMinusOneCentButton.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
@@ -910,6 +915,7 @@
           <button data-action="start-queue">确认价格并自动上架</button>
           <button data-action="sell-all-lowest">全页最低价一键上架</button>
           <button data-action="sweep-inventory">跨分页全库存清仓</button>
+          <button data-action="sweep-inventory-custom-price">全库存指定价直接上架</button>
           <button data-action="sweep-inventory-minus-one-cent">全库存最低价-0.01上架</button>
           <button data-action="toggle-pause">暂停脚本</button>
         </div>
@@ -976,6 +982,8 @@
           await sellAllVisibleAtLowestPrice();
         } else if (action === "sweep-inventory") {
           await sweepAllInventoryAtLowestPrice();
+        } else if (action === "sweep-inventory-custom-price") {
+          await sweepAllInventoryAtCustomPrice();
         } else if (action === "sweep-inventory-minus-one-cent") {
           await sweepAllInventoryAtLowestPriceMinusOneCent();
         } else if (action === "toggle-pause") {
@@ -1509,26 +1517,39 @@
     });
   }
 
-  function applyBulkPrice() {
+  function getBulkPriceInput() {
     const panel = findPanel();
-    const input = panel ? query('[data-role="bulk-price"]', panel) : null;
-    if (!input) {
-      return;
-    }
+    return panel ? query('[data-role="bulk-price"]', panel) : null;
+  }
 
-    const normalized = normalizeEditablePrice(input.value);
+  function getBulkPriceValue() {
+    const input = getBulkPriceInput();
+    const normalized = input ? normalizeEditablePrice(input.value) : "";
     if (!normalized) {
       updateStatus("请输入有效的统一售价后再应用。", "error");
+    }
+    return normalized;
+  }
+
+  function applyPriceToItems(items, price, status) {
+    items.forEach((item) => {
+      item.priceValue = price;
+      item.priceSource = "custom_price";
+      item.status = status;
+      item.statusTone = "success";
+      item.lastError = "";
+    });
+    renderRows();
+  }
+
+  function applyBulkPrice() {
+    const normalized = getBulkPriceValue();
+    if (!normalized) {
       return;
     }
 
     const items = selectedItems();
-    items.forEach((item) => {
-      item.priceValue = normalized;
-      item.status = "已设置自定义价";
-      item.statusTone = "success";
-    });
-    renderRows();
+    applyPriceToItems(items, normalized, "已设置自定义价");
     updateStatus(`已将 ${normalized} 应用到 ${items.length} 件已选物品。`, "success");
   }
 
@@ -2205,6 +2226,96 @@
     } catch (error) {
       updateStatus(`跨分页全库存清仓失败：${error.message}`, "error");
       log(`跨分页全库存清仓失败：${error.message}`);
+    } finally {
+      state.inventorySweepRunning = false;
+      state.paused = false;
+      renderSummary();
+    }
+  }
+
+  async function sweepAllInventoryAtCustomPrice() {
+    if (state.queue.running || state.inventorySweepRunning || !inventoryActionsAvailable()) {
+      updateStatus("当前已有正在执行的任务，请稍后再试。", "error");
+      return;
+    }
+
+    const customPrice = getBulkPriceValue();
+    if (!customPrice) {
+      return;
+    }
+
+    state.inventorySweepRunning = true;
+    renderSummary();
+    try {
+      updateStatus(`正在回到第一页并准备按指定价 ${customPrice} 直接上架全库存...`, "info");
+      log("开始执行全库存指定价直接上架。", { customPrice });
+      await gotoFirstInventoryPage();
+
+      let pageCounter = 0;
+      let totalAttempted = 0;
+      let totalQueued = 0;
+
+      while (pageCounter < 500) {
+        await waitWhilePaused("等待继续跨分页指定价直接上架");
+        pageCounter += 1;
+        scanInventory(true);
+        const currentPage = currentPageNumber();
+        const totalPages = totalPageNumber();
+        const visibleItems = Array.from(state.items.values()).filter((item) => isVisible(item.element));
+
+        log("开始处理库存分页（指定价直接上架）。", {
+          currentPage,
+          totalPages,
+          visibleCount: visibleItems.length,
+          customPrice,
+          signature: currentVisiblePageSignature(),
+        });
+
+        if (visibleItems.length > 0) {
+          totalAttempted += visibleItems.length;
+          setAllSelections(true);
+          const queueItems = selectedItems();
+          applyPriceToItems(queueItems, customPrice, "指定价已设置");
+
+          if (queueItems.length > 0) {
+            totalQueued += queueItems.length;
+            updateStatus(
+              `正在按指定价 ${customPrice} 上架第 ${currentPage || pageCounter}${totalPages ? `/${totalPages}` : ""} 页，共 ${queueItems.length} 件物品...`,
+              "info",
+            );
+            log("当前分页开始进入自动上架队列（指定价）。", {
+              currentPage,
+              queueCount: queueItems.length,
+              customPrice,
+              queueItems: queueItems.map((item) => ({
+                id: item.id,
+                name: item.name || item.label,
+                price: item.priceValue,
+              })),
+            });
+            await startQueue();
+          }
+        }
+
+        const moved = await gotoNextInventoryPage();
+        if (!moved) {
+          break;
+        }
+      }
+
+      updateStatus(
+        `全库存指定价直接上架完成。共尝试 ${totalAttempted} 件，送入队列 ${totalQueued} 件，指定价 ${customPrice}。`,
+        "success",
+      );
+      log("全库存指定价直接上架完成。", {
+        totalAttempted,
+        totalQueued,
+        customPrice,
+        endPage: currentPageNumber(),
+      });
+    } catch (error) {
+      updateStatus(`全库存指定价直接上架失败：${error.message}`, "error");
+      log(`全库存指定价直接上架失败：${error.message}`);
     } finally {
       state.inventorySweepRunning = false;
       state.paused = false;
