@@ -23,6 +23,8 @@
   const FALLBACK_PRICE_VALUE_KEY = "tm-batch-seller-fallback-value-v1";
   const PANEL_MIN_WIDTH = 320;
   const PANEL_MIN_HEIGHT = 420;
+  const PANEL_DRAG_EDGE_SIZE = 10;
+  const PANEL_DRAG_HOLD_MS = 250;
   const RESCAN_DELAY_MS = 400;
   const INVENTORY_SCAN_INTERVAL_MS = 1500;
   const PRICE_DELAY_MS = 850;
@@ -51,11 +53,11 @@
     nextHolderId: 1,
     paused: false,
     scanTimer: null,
-    autoScanTimer: null,
-    mutationObserver: null,
     panel: {
       drag: null,
+      pendingDrag: null,
       dragShield: null,
+      dragHoldTimer: null,
       resizeObserver: null,
     },
     settings: {
@@ -65,6 +67,7 @@
     inventorySweepRunning: false,
     counters: {
       lastScanCount: 0,
+      lastScanSignature: "",
     },
     queue: {
       running: false,
@@ -131,10 +134,6 @@
     }
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
-  }
-
-  function waitForAnimationFrame() {
-    return new Promise((resolve) => window.requestAnimationFrame(resolve));
   }
 
   function getPanelDocument() {
@@ -547,6 +546,7 @@
       }
 
       #${PANEL_ID} {
+        box-sizing: border-box;
         position: absolute;
         top: 16px;
         left: calc(100vw - 376px);
@@ -561,7 +561,10 @@
         z-index: 999999;
         color: #e5eef8;
         background: rgba(13, 20, 29, 0.96);
-        border: 1px solid rgba(115, 159, 209, 0.35);
+        background-clip: padding-box;
+        border: ${PANEL_DRAG_EDGE_SIZE}px solid transparent;
+        outline: 1px solid rgba(115, 159, 209, 0.35);
+        outline-offset: -${PANEL_DRAG_EDGE_SIZE}px;
         border-radius: 10px;
         box-shadow: 0 20px 48px rgba(0, 0, 0, 0.45);
         font: 13px/1.4 Arial, sans-serif;
@@ -579,6 +582,7 @@
         gap: 10px;
         padding: 12px 14px 8px;
         border-bottom: 1px solid rgba(115, 159, 209, 0.18);
+        cursor: move;
         user-select: none;
       }
 
@@ -587,7 +591,6 @@
         flex-direction: column;
         gap: 2px;
         min-width: 0;
-        cursor: move;
       }
 
       #${PANEL_ID} .tm-title {
@@ -931,6 +934,21 @@
   }
 
   function bindPanelEvents(panel) {
+    [
+      "pointerdown",
+      "pointerup",
+      "mousedown",
+      "mouseup",
+      "click",
+      "dblclick",
+      "contextmenu",
+      "touchstart",
+      "touchend",
+      "wheel",
+    ].forEach((eventName) => {
+      panel.addEventListener(eventName, (event) => event.stopPropagation());
+    });
+
     panel.addEventListener("click", async (event) => {
       const button = event.target.closest("button[data-action]");
       if (!button) {
@@ -1052,6 +1070,7 @@
     state.items.clear();
     state.selectedIds.clear();
     state.counters.lastScanCount = 0;
+    state.counters.lastScanSignature = "";
     renderRows();
     renderSummary();
   }
@@ -1065,6 +1084,20 @@
       return;
     }
     const holders = currentItemHolders();
+    const scanSignature = holders
+      .map((holder) => {
+        const image = query("img", holder);
+        return image?.src || holder.id || holder.dataset.econItem || "";
+      })
+      .join("|");
+    const alreadyWired =
+      holders.length === state.counters.lastScanCount &&
+      holders.every((holder) => holder.dataset.tmBatchId && query(`.${CHECKBOX_CLASS} input`, holder));
+
+    if (!forceStatus && scanSignature === state.counters.lastScanSignature && alreadyWired) {
+      return;
+    }
+
     const liveIds = new Set();
     holders.forEach((holder, index) => {
       const item = buildItemRecord(holder, index);
@@ -1073,6 +1106,7 @@
     });
     pruneMissingItems(liveIds);
     state.counters.lastScanCount = holders.length;
+    state.counters.lastScanSignature = scanSignature;
     renderRows();
     renderSummary();
 
@@ -1846,83 +1880,81 @@
     clickElement(closeButton);
   }
 
-  async function processQueueItem() {
-    await waitWhilePaused("等待继续上架队列");
-    const item = currentQueueItem();
-    if (!item) {
-      state.queue.running = false;
-      state.paused = false;
+  async function processQueue() {
+    while (state.queue.running) {
+      await waitWhilePaused("等待继续上架队列");
+      const item = currentQueueItem();
+      if (!item) {
+        break;
+      }
+
+      item.status = "准备中";
+      item.statusTone = "warn";
+      renderRows();
       updateStatus(
-        `队列完成。成功 ${state.queue.results.success.length}，失败 ${state.queue.results.failed.length}。`,
-        "success",
+        `正在处理 ${item.name || item.label}（${state.queue.index + 1}/${state.queue.items.length}）...`,
+        "info",
       );
-      renderSummary();
-      log("队列执行完成。");
-      return;
-    }
-
-    item.status = "准备中";
-    item.statusTone = "warn";
-    renderRows();
-    updateStatus(
-      `正在处理 ${item.name || item.label}（${state.queue.index + 1}/${state.queue.items.length}）...`,
-      "info",
-    );
-    log(`开始处理队列物品`, {
-      itemId: item.id,
-      label: item.label,
-      queueIndex: state.queue.index + 1,
-      queueTotal: state.queue.items.length,
-      currentPrice: item.priceValue,
-    });
-
-    try {
-      await waitWhilePaused(`准备读取 ${item.name || item.label} 的详情`);
-      await inspectItemDetails(item);
-      await waitWhilePaused(`准备打开 ${item.name || item.label} 的出售弹窗`);
-      await openSellDialog(item);
-      await waitWhilePaused(`准备填写 ${item.name || item.label} 的价格`);
-      await fillSellDialogPrice(item);
-      updateStatus(`正在自动勾选协议并提交 ${item.name || item.label}...`, "info");
-      await waitWhilePaused(`准备提交 ${item.name || item.label} 的上架`);
-      await submitSellDialog(item);
-      state.queue.results.success.push({
-        id: item.id,
-        name: item.name || item.label,
-        price: item.priceValue,
-      });
-      state.queue.index += 1;
-      renderRows();
-      renderSummary();
-      log(`已自动提交上架：${item.name || item.label}，价格 ${item.priceValue}`);
-      await sleep(250);
-      await processQueueItem();
-    } catch (error) {
-      item.status = "队列失败";
-      item.statusTone = "error";
-      item.lastError = error.message;
-      const diagnostics = collectSellButtonDiagnostics(currentInfoPanel());
-      state.queue.results.failed.push({
-        id: item.id,
-        name: item.name || item.label,
-        reason: error.message,
-      });
-      dismissSellDialogIfOpen();
-      state.queue.index += 1;
-      renderRows();
-      renderSummary();
-      log(`队列失败 ${item.label}：${error.message}`, {
+      log(`开始处理队列物品`, {
         itemId: item.id,
-        name: item.name || item.label,
-        appid: item.appid,
-        marketHashName: item.marketHashName,
-        price: item.priceValue,
-        diagnostics,
+        label: item.label,
+        queueIndex: state.queue.index + 1,
+        queueTotal: state.queue.items.length,
+        currentPrice: item.priceValue,
       });
-      updateStatus(`失败：${item.name || item.label}，原因：${error.message}`, "error");
+
+      try {
+        await waitWhilePaused(`准备读取 ${item.name || item.label} 的详情`);
+        await inspectItemDetails(item);
+        await waitWhilePaused(`准备打开 ${item.name || item.label} 的出售弹窗`);
+        await openSellDialog(item);
+        await waitWhilePaused(`准备填写 ${item.name || item.label} 的价格`);
+        await fillSellDialogPrice(item);
+        updateStatus(`正在自动勾选协议并提交 ${item.name || item.label}...`, "info");
+        await waitWhilePaused(`准备提交 ${item.name || item.label} 的上架`);
+        await submitSellDialog(item);
+        state.queue.results.success.push({
+          id: item.id,
+          name: item.name || item.label,
+          price: item.priceValue,
+        });
+        log(`已自动提交上架：${item.name || item.label}，价格 ${item.priceValue}`);
+      } catch (error) {
+        item.status = "队列失败";
+        item.statusTone = "error";
+        item.lastError = error.message;
+        const diagnostics = collectSellButtonDiagnostics(currentInfoPanel());
+        state.queue.results.failed.push({
+          id: item.id,
+          name: item.name || item.label,
+          reason: error.message,
+        });
+        dismissSellDialogIfOpen();
+        log(`队列失败 ${item.label}：${error.message}`, {
+          itemId: item.id,
+          name: item.name || item.label,
+          appid: item.appid,
+          marketHashName: item.marketHashName,
+          price: item.priceValue,
+          diagnostics,
+        });
+        updateStatus(`失败：${item.name || item.label}，原因：${error.message}`, "error");
+      }
+
+      state.queue.index += 1;
+      renderRows();
+      renderSummary();
       await sleep(250);
-      await processQueueItem();
     }
+
+    state.queue.running = false;
+    state.paused = false;
+    updateStatus(
+      `队列完成。成功 ${state.queue.results.success.length}，失败 ${state.queue.results.failed.length}。`,
+      "success",
+    );
+    renderSummary();
+    log("队列执行完成。");
   }
 
   async function startQueue() {
@@ -1949,7 +1981,7 @@
       itemIds: items.map((item) => item.id),
       prices: items.map((item) => ({ id: item.id, price: item.priceValue })),
     });
-    await processQueueItem();
+    await processQueue();
   }
 
   async function gotoNextInventoryPage() {
@@ -2342,25 +2374,75 @@
     panel.style.top = `${Math.min(Math.max(8, rect.top), maxTop)}px`;
   }
 
+  function shouldStartPanelDrag(event, panel) {
+    if (event.button !== 0) {
+      return false;
+    }
+    const target = event.target;
+    if (!target?.closest) {
+      return false;
+    }
+    if (target.closest("button, input, textarea, select, a, label")) {
+      return false;
+    }
+    if (target.closest('[data-role="drag-handle"], .tm-head')) {
+      return true;
+    }
+
+    const rect = panel.getBoundingClientRect();
+    const nearLeft = event.clientX - rect.left <= PANEL_DRAG_EDGE_SIZE;
+    const nearRight = rect.right - event.clientX <= PANEL_DRAG_EDGE_SIZE;
+    const nearTop = event.clientY - rect.top <= PANEL_DRAG_EDGE_SIZE;
+    const nearBottom = rect.bottom - event.clientY <= PANEL_DRAG_EDGE_SIZE;
+    return nearLeft || nearRight || nearTop || nearBottom;
+  }
+
+  function cancelPendingPanelDrag() {
+    if (state.panel.dragHoldTimer) {
+      window.clearTimeout(state.panel.dragHoldTimer);
+      state.panel.dragHoldTimer = null;
+    }
+    state.panel.pendingDrag = null;
+  }
+
+  function finishPanelDrag(panel) {
+    const wasDragging = Boolean(state.panel.drag);
+    cancelPendingPanelDrag();
+    if (state.panel.drag) {
+      state.panel.drag = null;
+      clampPanelInsideViewport(panel);
+    }
+    removeDragShield();
+    if (wasDragging) {
+      savePanelLayout(panel);
+    }
+  }
+
   function bindPanelDragAndResize(panel) {
     const panelWindow = panel.ownerDocument.defaultView || getPanelWindow();
-    const handle = query('[data-role="drag-handle"]', panel);
-    if (handle) {
-      handle.addEventListener("mousedown", (event) => {
-        if (event.button !== 0) {
+    panel.addEventListener("mousedown", (event) => {
+      if (!shouldStartPanelDrag(event, panel)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      cancelPendingPanelDrag();
+      state.panel.pendingDrag = {
+        startX: event.clientX,
+        startY: event.clientY,
+        baseLeft: panel.offsetLeft,
+        baseTop: panel.offsetTop,
+      };
+      state.panel.dragHoldTimer = window.setTimeout(() => {
+        if (!state.panel.pendingDrag) {
           return;
         }
-        event.preventDefault();
-        event.stopPropagation();
-        state.panel.drag = {
-          startX: event.clientX,
-          startY: event.clientY,
-          baseLeft: panel.offsetLeft,
-          baseTop: panel.offsetTop,
-        };
+        state.panel.drag = state.panel.pendingDrag;
+        state.panel.pendingDrag = null;
+        state.panel.dragHoldTimer = null;
         ensureDragShield();
-      });
-    }
+      }, PANEL_DRAG_HOLD_MS);
+    });
 
     panelWindow.addEventListener("mousemove", (event) => {
       if (!state.panel.drag) {
@@ -2376,12 +2458,11 @@
     });
 
     panelWindow.addEventListener("mouseup", () => {
-      if (state.panel.drag) {
-        state.panel.drag = null;
-        clampPanelInsideViewport(panel);
-      }
-      removeDragShield();
-      savePanelLayout(panel);
+      finishPanelDrag(panel);
+    }, true);
+
+    panelWindow.addEventListener("blur", () => {
+      finishPanelDrag(panel);
     });
 
     panelWindow.addEventListener("resize", () => {
@@ -2403,24 +2484,19 @@
       return;
     }
     const inventoryRoot = query("#inventories") || query(".inventory_ctn") || document.body;
-    state.mutationObserver = new MutationObserver(() => scheduleScan());
-    state.mutationObserver.observe(inventoryRoot, {
+    const mutationObserver = new MutationObserver(() => scheduleScan());
+    mutationObserver.observe(inventoryRoot, {
       childList: true,
       subtree: true,
     });
 
-    state.autoScanTimer = window.setInterval(() => scanInventory(false), INVENTORY_SCAN_INTERVAL_MS);
+    window.setInterval(() => scanInventory(false), INVENTORY_SCAN_INTERVAL_MS);
   }
 
-  async function boot() {
-    if (!isInventoryPage()) {
-      return;
-    }
+  function boot() {
     loadFallbackPriceSettings();
     injectStyles();
     buildPanel();
-    await waitForAnimationFrame();
-    updateStatus("已进入库存页，等待 Steam 库存渲染完成...", "info");
     scanInventory(true);
     startInventoryObservers();
     log("脚本已加载。");
