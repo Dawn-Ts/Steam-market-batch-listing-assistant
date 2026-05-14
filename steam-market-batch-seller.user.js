@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场批量上架助手
 // @namespace    https://steamcommunity.com/
-// @version      0.3.2
+// @version      0.3.3
 // @description  在 Steam 库存页批量选择物品、查询最低价、修改售价并自动执行上架流程。
 // @author       Codex
 // @match        https://steamcommunity.com/*
@@ -19,6 +19,8 @@
   const CHECKBOX_CLASS = "tm-batch-checkbox";
   const ROW_ID_PREFIX = "tm-batch-row-";
   const PANEL_LAYOUT_KEY = "tm-batch-seller-layout-v2";
+  const FALLBACK_PRICE_ENABLED_KEY = "tm-batch-seller-fallback-enabled-v1";
+  const FALLBACK_PRICE_VALUE_KEY = "tm-batch-seller-fallback-value-v1";
   const PANEL_MIN_WIDTH = 320;
   const PANEL_MIN_HEIGHT = 420;
   const RESCAN_DELAY_MS = 400;
@@ -55,6 +57,10 @@
       drag: null,
       dragShield: null,
       resizeObserver: null,
+    },
+    settings: {
+      fallbackPriceEnabled: false,
+      fallbackPriceValue: "",
     },
     inventorySweepRunning: false,
     counters: {
@@ -131,8 +137,22 @@
     return new Promise((resolve) => window.requestAnimationFrame(resolve));
   }
 
+  function getPanelDocument() {
+    try {
+      if (window.top?.document) {
+        return window.top.document;
+      }
+    } catch {}
+    return document;
+  }
+
+  function getPanelWindow() {
+    return getPanelDocument().defaultView || window;
+  }
+
   function updateStatus(message, tone = "info") {
-    const status = query(`#${PANEL_ID} [data-role="status"]`);
+    const panel = findPanel();
+    const status = panel ? query('[data-role="status"]', panel) : null;
     if (!status) {
       return;
     }
@@ -339,11 +359,11 @@
   }
 
   function findPanel() {
-    return query(`#${PANEL_ID}`);
+    return query(`#${PANEL_ID}`, getPanelDocument());
   }
 
   function findPanelHost() {
-    return query(`#${PANEL_HOST_ID}`);
+    return query(`#${PANEL_HOST_ID}`, getPanelDocument());
   }
 
   function ensurePanelHost() {
@@ -351,14 +371,16 @@
     if (existing) {
       return existing;
     }
-    const host = document.createElement("div");
+    const panelDocument = getPanelDocument();
+    const host = panelDocument.createElement("div");
     host.id = PANEL_HOST_ID;
-    document.documentElement.appendChild(host);
+    panelDocument.documentElement.appendChild(host);
     return host;
   }
 
   function renderLogs() {
-    const container = query(`#${PANEL_ID} [data-role="logs"]`);
+    const panel = findPanel();
+    const container = panel ? query('[data-role="logs"]', panel) : null;
     if (!container) {
       return;
     }
@@ -391,6 +413,8 @@
     const queryPricesButton = query('[data-action="query-prices"]', panel);
     const applyBulkPriceButton = query('[data-action="apply-bulk-price"]', panel);
     const bulkPriceInput = query('[data-role="bulk-price"]', panel);
+    const fallbackEnabledInput = query('[data-role="fallback-enabled"]', panel);
+    const fallbackPriceInput = query('[data-role="fallback-price"]', panel);
     const mode = query('[data-role="mode"]', panel);
     const summary = query('[data-role="result-summary"]', panel);
     const inventoryReady = inventoryActionsAvailable();
@@ -442,6 +466,17 @@
     if (bulkPriceInput) {
       bulkPriceInput.disabled = !inventoryReady || state.queue.running || state.inventorySweepRunning;
     }
+    if (fallbackEnabledInput) {
+      fallbackEnabledInput.checked = state.settings.fallbackPriceEnabled;
+      fallbackEnabledInput.disabled = state.queue.running || state.inventorySweepRunning;
+    }
+    if (fallbackPriceInput) {
+      if (fallbackPriceInput !== fallbackPriceInput.ownerDocument.activeElement) {
+        fallbackPriceInput.value = state.settings.fallbackPriceValue;
+      }
+      fallbackPriceInput.disabled =
+        !state.settings.fallbackPriceEnabled || state.queue.running || state.inventorySweepRunning;
+    }
     if (mode) {
       mode.textContent = inventoryReady ? (inventoryLoaded ? "库存页" : "库存页(加载中)") : "非库存页";
     }
@@ -476,7 +511,8 @@
   }
 
   function renderRows() {
-    const container = query(`#${PANEL_ID} [data-role="rows"]`);
+    const panel = findPanel();
+    const container = panel ? query('[data-role="rows"]', panel) : null;
     if (!container) {
       return;
     }
@@ -496,10 +532,11 @@
   }
 
   function injectStyles() {
-    if (query(`#${STYLE_ID}`)) {
+    const panelDocument = getPanelDocument();
+    if (query(`#${STYLE_ID}`, panelDocument)) {
       return;
     }
-    const style = document.createElement("style");
+    const style = panelDocument.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
       #${PANEL_HOST_ID} {
@@ -659,6 +696,28 @@
         gap: 8px;
       }
 
+      #${PANEL_ID} .tm-inline-fallback {
+        grid-template-columns: minmax(0, 1fr) minmax(110px, 140px);
+        align-items: center;
+      }
+
+      #${PANEL_ID} .tm-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+        padding: 0 10px;
+        border: 1px solid rgba(115, 159, 209, 0.22);
+        border-radius: 7px;
+        background: rgba(8, 14, 22, 0.82);
+        color: #f6fbff;
+        cursor: pointer;
+      }
+
+      #${PANEL_ID} .tm-toggle input {
+        margin: 0;
+      }
+
       #${PANEL_ID} input[type="text"] {
         width: 100%;
         border: 1px solid rgba(115, 159, 209, 0.22);
@@ -792,15 +851,16 @@
         cursor: pointer;
       }
     `;
-    document.head.appendChild(style);
+    (panelDocument.head || panelDocument.documentElement).appendChild(style);
   }
 
   function buildPanel() {
-    if (findPanel()) {
-      return;
+    const existing = findPanel();
+    if (existing) {
+      existing.remove();
     }
     const host = ensurePanelHost();
-    const panel = document.createElement("aside");
+    const panel = getPanelDocument().createElement("aside");
     panel.id = PANEL_ID;
     panel.innerHTML = `
       <div class="tm-head">
@@ -835,6 +895,13 @@
         <div class="tm-inline">
           <input type="text" data-role="bulk-price" placeholder="统一售价（0.00）" />
           <button data-action="apply-bulk-price">应用售价</button>
+        </div>
+        <div class="tm-inline tm-inline-fallback">
+          <label class="tm-toggle">
+            <input type="checkbox" data-role="fallback-enabled" />
+            <span>查价失败用预设价</span>
+          </label>
+          <input type="text" data-role="fallback-price" placeholder="预设售价（0.00）" />
         </div>
         <div class="tm-queue-actions">
           <button data-action="start-queue">确认价格并自动上架</button>
@@ -921,6 +988,19 @@
         item.priceValue = target.value;
         item.status = target.value ? "已编辑价格" : "待填写价格";
         item.statusTone = target.value ? "muted" : "warn";
+        renderSummary();
+      } else if (target.matches('[data-role="fallback-price"]')) {
+        state.settings.fallbackPriceValue = target.value;
+        saveFallbackPriceSettings();
+        renderSummary();
+      }
+    });
+
+    panel.addEventListener("change", (event) => {
+      const target = event.target;
+      if (target.matches('[data-role="fallback-enabled"]')) {
+        state.settings.fallbackPriceEnabled = Boolean(target.checked);
+        saveFallbackPriceSettings();
         renderSummary();
       }
     });
@@ -1013,7 +1093,7 @@
       return state.panel.dragShield;
     }
     const host = ensurePanelHost();
-    const shield = document.createElement("div");
+    const shield = getPanelDocument().createElement("div");
     shield.dataset.role = "tm-drag-shield";
     Object.assign(shield.style, {
       position: "absolute",
@@ -1369,15 +1449,17 @@
           normalizedPrice: item.priceValue,
         });
       } catch (error) {
-        item.status = "查价失败";
-        item.statusTone = "error";
-        item.lastError = error.message;
-        item.priceSource = "";
-        log(`查价失败 ${item.label}：${error.message}`, {
-          itemId: item.id,
-          appid: item.appid,
-          marketHashName: item.marketHashName,
-        });
+        if (!applyFallbackPrice(item, error.message)) {
+          item.status = "查价失败";
+          item.statusTone = "error";
+          item.lastError = error.message;
+          item.priceSource = "";
+          log(`查价失败 ${item.label}：${error.message}`, {
+            itemId: item.id,
+            appid: item.appid,
+            marketHashName: item.marketHashName,
+          });
+        }
       }
       renderRows();
       await waitWhilePaused(`查价完成后暂停：${item.name || item.label || item.id}`);
@@ -1388,12 +1470,14 @@
     log(`批量查最低价完成：${source}`, {
       count: items.length,
       successCount: items.filter((item) => item.status === "最低价已加载").length,
+      fallbackCount: items.filter((item) => item.status === "查价失败，已用预设价").length,
       failedCount: items.filter((item) => item.status === "查价失败").length,
     });
   }
 
   function applyBulkPrice() {
-    const input = query(`#${PANEL_ID} [data-role="bulk-price"]`);
+    const panel = findPanel();
+    const input = panel ? query('[data-role="bulk-price"]', panel) : null;
     if (!input) {
       return;
     }
@@ -1412,6 +1496,52 @@
     });
     renderRows();
     updateStatus(`已将 ${normalized} 应用到 ${items.length} 件已选物品。`, "success");
+  }
+
+  function loadFallbackPriceSettings() {
+    try {
+      state.settings.fallbackPriceEnabled = window.localStorage.getItem(FALLBACK_PRICE_ENABLED_KEY) === "1";
+      state.settings.fallbackPriceValue = window.localStorage.getItem(FALLBACK_PRICE_VALUE_KEY) || "";
+    } catch {
+      state.settings.fallbackPriceEnabled = false;
+      state.settings.fallbackPriceValue = "";
+    }
+  }
+
+  function saveFallbackPriceSettings() {
+    try {
+      window.localStorage.setItem(
+        FALLBACK_PRICE_ENABLED_KEY,
+        state.settings.fallbackPriceEnabled ? "1" : "0",
+      );
+      window.localStorage.setItem(FALLBACK_PRICE_VALUE_KEY, state.settings.fallbackPriceValue || "");
+    } catch {}
+  }
+
+  function getFallbackPriceValue() {
+    if (!state.settings.fallbackPriceEnabled) {
+      return "";
+    }
+    return normalizeEditablePrice(state.settings.fallbackPriceValue);
+  }
+
+  function applyFallbackPrice(item, reason) {
+    const fallbackPrice = getFallbackPriceValue();
+    if (!fallbackPrice) {
+      return false;
+    }
+    item.priceDisplay = fallbackPrice;
+    item.priceValue = fallbackPrice;
+    item.priceSource = "fallback_price";
+    item.status = "查价失败，已用预设价";
+    item.statusTone = "warn";
+    item.lastError = reason;
+    log(`查价失败后使用预设价：${item.name || item.label}`, {
+      itemId: item.id,
+      fallbackPrice,
+      reason,
+    });
+    return true;
   }
 
   function formatPriceNumber(value) {
@@ -2174,42 +2304,46 @@
     if (!panel) {
       return;
     }
+    const panelWindow = panel.ownerDocument.defaultView || getPanelWindow();
     const rect = panel.getBoundingClientRect();
     const layout = {
       top: Math.max(8, Math.round(rect.top)),
       left: Math.max(8, Math.round(rect.left)),
-      width: Math.max(PANEL_MIN_WIDTH, Math.round(rect.width)),
-      height: Math.max(PANEL_MIN_HEIGHT, Math.round(rect.height)),
+      width: Math.max(PANEL_MIN_WIDTH, Math.min(Math.round(rect.width), panelWindow.innerWidth - 8)),
+      height: Math.max(PANEL_MIN_HEIGHT, Math.min(Math.round(rect.height), panelWindow.innerHeight - 8)),
     };
     window.localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(layout));
   }
 
   function applyStoredPanelLayout(panel) {
+    const panelWindow = panel.ownerDocument.defaultView || getPanelWindow();
     const saved = loadPanelLayout();
     const width = Math.max(PANEL_MIN_WIDTH, Number(saved?.width) || 360);
     const height = Math.max(
       PANEL_MIN_HEIGHT,
-      Number(saved?.height) || Math.min(780, window.innerHeight - 32),
+      Number(saved?.height) || Math.min(780, panelWindow.innerHeight - 32),
     );
     const top = Math.max(8, Number(saved?.top) || 16);
-    const defaultLeft = Math.max(8, window.innerWidth - width - 16);
+    const defaultLeft = Math.max(8, panelWindow.innerWidth - width - 16);
     const left = Math.max(8, Number(saved?.left) || defaultLeft);
-    panel.style.width = `${Math.min(width, window.innerWidth - 8)}px`;
-    panel.style.height = `${Math.min(height, window.innerHeight - 8)}px`;
-    panel.style.left = `${Math.min(left, Math.max(8, window.innerWidth - width - 8))}px`;
-    panel.style.top = `${Math.min(top, Math.max(8, window.innerHeight - height - 8))}px`;
+    panel.style.width = `${Math.min(width, panelWindow.innerWidth - 8)}px`;
+    panel.style.height = `${Math.min(height, panelWindow.innerHeight - 8)}px`;
+    panel.style.left = `${Math.min(left, Math.max(8, panelWindow.innerWidth - width - 8))}px`;
+    panel.style.top = `${Math.min(top, Math.max(8, panelWindow.innerHeight - height - 8))}px`;
     panel.style.right = "auto";
   }
 
   function clampPanelInsideViewport(panel) {
+    const panelWindow = panel.ownerDocument.defaultView || getPanelWindow();
     const rect = panel.getBoundingClientRect();
-    const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
-    const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+    const maxLeft = Math.max(8, panelWindow.innerWidth - rect.width - 8);
+    const maxTop = Math.max(8, panelWindow.innerHeight - rect.height - 8);
     panel.style.left = `${Math.min(Math.max(8, rect.left), maxLeft)}px`;
     panel.style.top = `${Math.min(Math.max(8, rect.top), maxTop)}px`;
   }
 
   function bindPanelDragAndResize(panel) {
+    const panelWindow = panel.ownerDocument.defaultView || getPanelWindow();
     const handle = query('[data-role="drag-handle"]', panel);
     if (handle) {
       handle.addEventListener("mousedown", (event) => {
@@ -2228,7 +2362,7 @@
       });
     }
 
-    window.addEventListener("mousemove", (event) => {
+    panelWindow.addEventListener("mousemove", (event) => {
       if (!state.panel.drag) {
         return;
       }
@@ -2241,7 +2375,7 @@
       clampPanelInsideViewport(panel);
     });
 
-    window.addEventListener("mouseup", () => {
+    panelWindow.addEventListener("mouseup", () => {
       if (state.panel.drag) {
         state.panel.drag = null;
         clampPanelInsideViewport(panel);
@@ -2250,7 +2384,7 @@
       savePanelLayout(panel);
     });
 
-    window.addEventListener("resize", () => {
+    panelWindow.addEventListener("resize", () => {
       clampPanelInsideViewport(panel);
       savePanelLayout(panel);
     });
@@ -2279,16 +2413,15 @@
   }
 
   async function boot() {
+    if (!isInventoryPage()) {
+      return;
+    }
+    loadFallbackPriceSettings();
     injectStyles();
     buildPanel();
     await waitForAnimationFrame();
-    if (isInventoryPage()) {
-      updateStatus("已进入库存页，等待 Steam 库存渲染完成...", "info");
-      scanInventory(true);
-    } else {
-      clearInventoryState();
-      updateStatus("当前不是库存页，库存操作已禁用。", "info");
-    }
+    updateStatus("已进入库存页，等待 Steam 库存渲染完成...", "info");
+    scanInventory(true);
     startInventoryObservers();
     log("脚本已加载。");
   }
